@@ -15,7 +15,9 @@ import { pathToFileURL } from "node:url"
  * stream. The request also needs anti-bot tokens minted by the live page JS, so a
  * plain curl to duck.ai cannot work. A local relay (DuckAI2API) drives a real
  * browser to obtain those tokens and exposes an OpenAI-compatible endpoint; this
- * plugin calls that relay, writes the bytes to disk and returns the image.
+ * plugin calls that relay, writes the bytes to disk and returns the image. When
+ * the relay is missing, the first `gen` installs it itself (unless autoSetup is
+ * off); `duck_setup` runs the same steps on demand.
  *
  * Everything project-specific lives in plugin options, so the same package works
  * in any repo: point `outputDir` / `presets` at your own art folders and recipes.
@@ -42,6 +44,11 @@ export interface DuckArtOptions {
   relayUrl?: string
   /** Spawn the relay when it is not answering. Default true. Env: DUCKAI_AUTO_START */
   autoStart?: boolean
+  /**
+   * Install the relay on the first `gen` call when it is missing. Default true.
+   * The install takes a few minutes and downloads ~600 MB once. Env: DUCKAI_AUTO_SETUP
+   */
+  autoSetup?: boolean
   /** Chromium/Chrome binary for the relay. Env: DUCKAI_CHROME_PATH */
   chromePath?: string
   /** Duck.ai model id. Env: DUCKAI_IMAGE_MODEL */
@@ -463,6 +470,7 @@ export default Plugin.define({
       progress: (status: string) => Promise<void>,
       signal: AbortSignal,
       force: boolean,
+      retryHint = "duck_setup",
     ): Promise<string[]> {
       const relayDir = relayDirOf(settings)
       const model = settings.model ?? process.env.DUCKAI_IMAGE_MODEL ?? MODEL_DEFAULT
@@ -477,15 +485,15 @@ export default Plugin.define({
           probe = await runStep(tool, ["--version"], { signal, timeoutMs: 30_000 })
         } catch {
           throw new Error(
-            `\`${tool}\` is not on PATH. Install ${tool === "git" ? "Git" : "Python 3.11+"} and run duck_setup again.`,
+            `\`${tool}\` is not on PATH. Install ${tool === "git" ? "Git" : "Python 3.11+"} and run ${retryHint} again.`,
           )
         }
         if (probe.code !== 0) {
           throw new Error(
             `\`${tool} --version\` failed (exit ${probe.code}). ` +
               (tool === "python"
-                ? "If this is the Microsoft Store stub, install the real Python 3.11+ and run duck_setup again."
-                : "Install Git and run duck_setup again."),
+                ? `If this is the Microsoft Store stub, install the real Python 3.11+ and run ${retryHint} again.`
+                : `Install Git and run ${retryHint} again.`),
           )
         }
       }
@@ -662,13 +670,25 @@ export default Plugin.define({
 
       const unavailable = await ensureRelay(relayDir)
       if (unavailable) {
-        throw new Error(
-          `${unavailable}.\n` +
-            `Run the \`duck_setup\` tool to install and start it automatically ` +
-            `(clones ${REPO_URL}, creates .venv, installs requirements.txt and Playwright Chromium, then starts the relay).\n` +
-            `Or start an existing install by hand:\n` +
-            `  cd ${relayDir} && "${venvPython(relayDir)}" -m uvicorn main:app --host 127.0.0.1 --port ${RELAY_PORT}`,
-        )
+        const autoSetup = settings.autoSetup ?? process.env.DUCKAI_AUTO_SETUP !== "0"
+        if (!autoSetup) {
+          throw new Error(
+            `${unavailable}.\n` +
+              `Auto-setup is off. Run the \`duck_setup\` tool to install and start it automatically ` +
+              `(clones ${REPO_URL}, creates .venv, installs requirements.txt and Playwright Chromium, then starts the relay).\n` +
+              `Or start an existing install by hand:\n` +
+              `  cd ${relayDir} && "${venvPython(relayDir)}" -m uvicorn main:app --host 127.0.0.1 --port ${RELAY_PORT}`,
+          )
+        }
+        // First run on a fresh machine: install the relay right here so one `gen`
+        // call is enough from prompt to picture. Resumable - a retry continues.
+        await progress("relay not found - installing it now (a few minutes, ~600 MB download, first run only)...")
+        try {
+          await bootstrap(settings, progress, signal, false, "gen")
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          throw new Error(`${message}\nFix the cause and call \`gen\` again - setup resumes where it stopped.`)
+        }
       }
 
       // Resolve the destination before the request so the folder exists when bytes arrive.
@@ -711,7 +731,8 @@ export default Plugin.define({
           "Generate artwork with Duck.ai (free, no API key) and write it straight into the project. " +
           "Pick a preset for size/folder/style and pass a plain-English visual description as `prompt`. " +
           `Presets: ${presetList}. ` +
-          "Returns the saved paths plus the images. Takes roughly 25-45 seconds per batch.",
+          "When the local relay is missing, the first call installs it automatically (a few minutes), " +
+          "unless autoSetup is off. Takes roughly 25-45 seconds per batch.",
         input: {
           type: "object",
           properties: {
@@ -810,7 +831,8 @@ export default Plugin.define({
           "Installs to the configured relayDir, creating the repo, a Python virtualenv, the packages " +
           "in requirements.txt, Playwright's Chromium browser (~314 MB) and a .env, then starts the " +
           "relay and waits until it answers. Needs git and Python 3.11+ on PATH. " +
-          "Only run this when `gen` reports the relay is missing, or when reinstalling.",
+          "`gen` runs these same steps itself when the relay is missing; call this to pre-install, " +
+          "repair a half-broken install (force), or reinstall.",
         input: {
           type: "object",
           properties: {
