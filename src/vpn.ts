@@ -84,7 +84,7 @@ export async function collectFromClipboard(
     )
   }
   await progress(
-    `Нажми Share на серверах в happ (нужно ${need}) — подбираю ссылки из буфера автоматически...`,
+    `Press Share on servers in happ (${need} needed) — picking links from the clipboard automatically...`,
   )
   const deadline = Date.now() + timeoutSec * 1000
   for (;;) {
@@ -100,19 +100,19 @@ export async function collectFromClipboard(
       try {
         const parsed = parseShareLink(link)
         found.push(link)
-        await progress(`Поймано ${found.length}/${need}: ${parsed.tag} [${parsed.protocol}]`)
+        await progress(`Caught ${found.length}/${need}: ${parsed.tag} [${parsed.protocol}]`)
       } catch {
-        await progress(`Пропущена ссылка из буфера (не понял формат, такое бывает с мусором вокруг).`)
+        await progress(`Skipped a clipboard link (unrecognized format, usually surrounding noise).`)
       }
       if (found.length >= need) return found
     }
     if (Date.now() >= deadline) {
       if (!found.length) {
         throw new Error(
-          `за ${timeoutSec}с не поймал ни одной ссылки. Нажми Share на сервере в happ и запусти сбор заново.`,
+          `caught no links in ${timeoutSec}s. Press Share on a server in happ and start collection again.`,
         )
       }
-      await progress(`Время вышло, беру что есть: ${found.length}.`)
+      await progress(`Time is up, taking what we have: ${found.length}.`)
       return found
     }
     await new Promise((r) => setTimeout(r, 1500))
@@ -138,7 +138,7 @@ export async function buildPoolFromLinks(rawLinks: string[], opts: BuildOptions)
   }
   if (!exits.length) {
     throw new Error(
-      "ни одна ссылка не подошла." + (skipped.length ? `\n- ${skipped.join("\n- ")}` : ""),
+      "no link usable." + (skipped.length ? `\n- ${skipped.join("\n- ")}` : ""),
     )
   }
   const say = opts.progress ?? (async () => undefined)
@@ -157,13 +157,13 @@ export async function buildPoolFromLinks(rawLinks: string[], opts: BuildOptions)
     } catch (error) {
       probeMs.push(-1)
       await say(
-        `exit ${i + 1} НЕ отвечает: ${exits[i].tag} (${error instanceof Error ? error.message : String(error)})`,
+        `exit ${i + 1} UNREACHABLE: ${exits[i].tag} (${error instanceof Error ? error.message : String(error)})`,
       )
     }
   }
   if (!alive.length) {
     await stopSidecar(dir)
-    throw new Error("ни один exit не дотянулся до duck.ai — проверь серверы в happ и повтори.")
+    throw new Error("no exit reached duck.ai — check the servers in happ and retry.")
   }
   return { exits, proxies, ports, probeMs, skipped }
 }
