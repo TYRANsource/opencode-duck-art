@@ -93,7 +93,7 @@ export async function fetchSubscription(url: string, hwid: string): Promise<Subs
   if (res.status === 404) {
     throw new Error(
       "the panel answered 404: on HWID-limited keys this means the device slots are full. " +
-        "Use the clipboard mode instead (share a few servers from happ, no new device is registered).",
+        "Free a slot on the panel side and try again.",
     )
   }
   if (!res.ok) throw new Error(`the panel answered HTTP ${res.status}`)

@@ -1,12 +1,12 @@
 /**
- * duck_vpn orchestration: clipboard collection, pool builds, relay `.env`
+ * duck_vpn orchestration: pool builds, relay `.env`
  * wiring and status. Relay process control itself (start/stop) stays in
  * `index.ts`, which owns the spawn code; this module only kills by port.
  */
 import { spawn } from "node:child_process"
 import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises"
 import { join } from "node:path"
-import { extractShareLinks, parseShareLink, type ExitServer } from "./vpn-links.js"
+import { parseShareLink, type ExitServer } from "./vpn-links.js"
 import { loadSecrets, saveSecrets, vpnDir, type VpnSecrets } from "./vpn-store.js"
 import {
   describeExits,
@@ -39,84 +39,6 @@ export interface BuiltPool {
 export async function readPoolProxies(dir: string = vpnDir()): Promise<string[]> {
   const secrets = await loadSecrets(dir)
   return secrets.ports.map((p) => `socks5://127.0.0.1:${p}`)
-}
-
-function readClipboard(): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const command =
-      process.platform === "win32"
-        ? { cmd: "powershell", args: ["-NoProfile", "-NonInteractive", "-Command", "Get-Clipboard -Raw"] }
-        : process.platform === "darwin"
-          ? { cmd: "pbpaste", args: [] as string[] }
-          : { cmd: "xclip", args: ["-o", "-selection", "clipboard"] }
-    const child = spawn(command.cmd, command.args, { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] })
-    let out = ""
-    child.stdout?.on("data", (chunk: Buffer) => {
-      out += String(chunk)
-    })
-    child.on("error", (error: Error) => reject(error))
-    child.on("close", (code: number | null) => {
-      if (code === 0) resolve(out)
-      else reject(new Error(`clipboard read failed (exit ${code})`))
-    })
-  })
-}
-
-/**
- * Watch the clipboard until `need` valid share links arrive or the deadline
- * hits. The user clicks Share per server in happ; every new link is picked up
- * automatically, nothing is pasted anywhere by hand.
- */
-export async function collectFromClipboard(
-  need: number,
-  timeoutSec: number,
-  progress: (line: string) => Promise<void>,
-): Promise<string[]> {
-  const found: string[] = []
-  const seen = new Set<string>()
-  try {
-    await readClipboard()
-  } catch {
-    throw new Error(
-      process.platform === "linux"
-        ? "cannot read the clipboard (need `xclip` on PATH)."
-        : "cannot read the clipboard on this machine.",
-    )
-  }
-  await progress(
-    `Press Share on servers in happ (${need} needed) — picking links from the clipboard automatically...`,
-  )
-  const deadline = Date.now() + timeoutSec * 1000
-  for (;;) {
-    let text = ""
-    try {
-      text = await readClipboard()
-    } catch {
-      // Transient clipboard lock (another app holds it): keep waiting.
-    }
-    for (const link of extractShareLinks(text)) {
-      if (seen.has(link)) continue
-      seen.add(link)
-      try {
-        const parsed = parseShareLink(link)
-        found.push(link)
-        await progress(`Caught ${found.length}/${need}: ${parsed.tag} [${parsed.protocol}]`)
-      } catch {
-        await progress(`Skipped a clipboard link (unrecognized format, usually surrounding noise).`)
-      }
-      if (found.length >= need) return found
-    }
-    if (Date.now() >= deadline) {
-      if (!found.length) {
-        throw new Error(
-          `caught no links in ${timeoutSec}s. Press Share on a server in happ and start collection again.`,
-        )
-      }
-      await progress(`Time is up, taking what we have: ${found.length}.`)
-      return found
-    }
-    await new Promise((r) => setTimeout(r, 1500))
-  }
 }
 
 /** Validate raw share links into exits (at most `poolSize`), collecting skip reasons. */

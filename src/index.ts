@@ -8,7 +8,6 @@ import { pathToFileURL } from "node:url"
 import { type ExitServer } from "./vpn-links.js"
 import {
   buildPoolFromExits,
-  collectFromClipboard,
   detectHapp,
   mergeRelayEnv,
   parseLinkPool,
@@ -101,8 +100,6 @@ export interface VpnSettings {
   basePort?: number
   /** xray binary. Default: happ-desktop's bundled core on Windows, else PATH. (DUCK_VPN_XRAY) */
   xrayPath?: string
-  /** Clipboard-watch deadline for `collect-links`. Default 180s. (DUCK_VPN_COLLECT_TIMEOUT) */
-  collectTimeoutSec?: number
 }
 
 /** Generic fallbacks so the plugin is useful before any preset is configured. */
@@ -536,13 +533,10 @@ export default Plugin.define({
       const poolSize = Math.min(Math.max(Math.trunc(Number(vpn.poolSize ?? process.env.DUCK_VPN_POOL_SIZE ?? 4)) || 4, 1), 8)
       const basePort =
         Math.trunc(Number(vpn.basePort ?? process.env.DUCK_VPN_BASE_PORT ?? 11808)) || 11808
-      const collectTimeoutSec =
-        Math.trunc(Number(vpn.collectTimeoutSec ?? process.env.DUCK_VPN_COLLECT_TIMEOUT ?? 180)) || 180
       return {
         poolSize,
         basePort,
         xrayPath: vpn.xrayPath ?? process.env.DUCK_VPN_XRAY ?? undefined,
-        collectTimeoutSec,
       }
     }
 
@@ -898,7 +892,7 @@ export default Plugin.define({
                   ? `\nVPN pool active (${pool.length} exit(s), rotation on ban is automatic). ` +
                     `If every exit is banned, run the \`duck_vpn\` tool (test / refresh).`
                   : `\nNo VPN pool configured. If duck.ai is blocked here or bans this IP, run the ` +
-                    `\`duck_vpn\` tool — \`/duck-vpn\` walks through setup (subscription or clipboard mode).`
+                    `\`duck_vpn\` tool — \`/duck-vpn\` walks through setup (paste the subscription URL once).`
               } catch {
                 vpnHint = ""
               }
@@ -990,7 +984,7 @@ export default Plugin.define({
         name: "duck_vpn",
         description:
           "Own VPN pool for the Duck.ai relay (happ-compatible, no system VPN changes). " +
-          "Actions: status | setup-subscription | collect-links | build-pool | test | switch-exit | refresh | off. " +
+          "Actions: status | setup-subscription | build-pool | test | switch-exit | refresh | off. " +
           "Builds a local xray sidecar (one SOCKS inbound per exit, happ app untouched) and points the relay at it, " +
           "so ban/limit on one exit auto-rotates to the next. Secrets stay in the user-data dir, never in the repo.",
         input: {
@@ -1000,28 +994,11 @@ export default Plugin.define({
               type: "string",
               description:
                 "status: show pool/sidecar/relay state. setup-subscription: build from a happ subscription URL " +
-                "(pass `url`; without it returns the ask-the-user text). collect-links: watch the clipboard while " +
-                "the user presses Share per server in happ, then build. build-pool: (re)build from `links` or the " +
-                "stored ones. test: probe every exit. switch-exit: prefer exit `index` (1-based). refresh: re-fetch " +
+                "(pass `url`; without it returns the ask-the-user text). build-pool: rebuild from the stored " +
+                "servers. test: probe every exit. switch-exit: prefer exit `index` (1-based). refresh: re-fetch " +
                 "the subscription and rebuild. off: stop the sidecar, relay goes direct again.",
             },
             url: { type: "string", description: "happ subscription URL (setup-subscription only)." },
-            links: {
-              type: "array",
-              items: { type: "string" },
-              description: "Share links (build-pool only). Defaults to the stored ones.",
-            },
-            need: {
-              type: "integer",
-              description: "How many links to collect from the clipboard. Defaults to the pool size.",
-              minimum: 1,
-              maximum: 8,
-            },
-            timeoutSec: {
-              type: "integer",
-              description: "Clipboard-watch deadline. Defaults to the configured collect timeout.",
-              minimum: 15,
-            },
             index: {
               type: "integer",
               description: "1-based exit number (switch-exit only).",
@@ -1034,9 +1011,6 @@ export default Plugin.define({
           const input = raw as {
             action?: string
             url?: string
-            links?: string[]
-            need?: number
-            timeoutSec?: number
             index?: number
           }
           const progress = async (status: string) => {
@@ -1136,7 +1110,7 @@ export default Plugin.define({
               } else if (secrets.exits.length || secrets.links.length) {
                 lines.push("servers stored but pool not built — run build-pool.");
               } else {
-                lines.push("no servers stored — run setup-subscription or collect-links.");
+                lines.push("no servers stored — run setup-subscription.");
               }
               return fail(lines.join("\n"))
             }
@@ -1145,8 +1119,7 @@ export default Plugin.define({
               const url = (input.url ?? "").trim()
               if (!url) {
                 return fail(
-                  "ASK_USER: need the happ subscription URL (paste once, it is stored in the local user-data dir, never in the repo). " +
-                    "If the key's device slots are full, skip this and use collect-links instead (no new device is registered).",
+                  "ASK_USER: need the happ subscription URL (paste once, it is stored in the local user-data dir, never in the repo).",
                 )
               }
               const secrets = await loadSecrets(dir)
@@ -1177,43 +1150,26 @@ export default Plugin.define({
               return fail(await buildFlow(exits, skipped, "subscription", url, sub.links))
             }
 
-            if (action === "collect-links") {
-              const need = Math.min(Math.max(Math.trunc(Number(input.need)) || vpnOpts.poolSize, 1), 8)
-              const timeout = Math.max(Math.trunc(Number(input.timeoutSec)) || vpnOpts.collectTimeoutSec, 15)
-              const links = await collectFromClipboard(need, timeout, progress)
-              const { exits, skipped } = parseLinkPool(links, vpnOpts.poolSize)
-              if (!exits.length) {
-                return fail("no usable exits collected." + (skipped.length ? `\n- ${skipped.slice(0, 8).join("\n- ")}` : ""))
-              }
-              return fail(await buildFlow(exits, skipped, "links", undefined, links))
-            }
-
             if (action === "build-pool") {
               const secrets = await loadSecrets(dir)
-              const links = input.links?.length ? input.links : secrets.links
-              if (links.length) {
-                const { exits, skipped } = parseLinkPool(links, vpnOpts.poolSize)
-                if (!exits.length) return fail("no usable exits in the given links.")
-                return fail(await buildFlow(exits, skipped, secrets.mode ?? "links", secrets.subUrl, links))
+              if (!secrets.exits.length) {
+                return fail("no stored servers: run setup-subscription first.")
               }
-              if (secrets.exits.length) {
-                const exits: ExitServer[] = secrets.exits.slice(0, vpnOpts.poolSize).map((e) => ({
-                  tag: e.tag,
-                  protocol: e.protocol as ExitServer["protocol"],
-                  host: e.host,
-                  port: e.port,
-                  link: "",
-                  outbound: e.outbound,
-                }))
-                return fail(await buildFlow(exits, [], secrets.mode ?? "links", secrets.subUrl, secrets.links))
-              }
-              return fail("no links: pass `links` or run setup-subscription / collect-links first.")
+              const exits: ExitServer[] = secrets.exits.slice(0, vpnOpts.poolSize).map((e) => ({
+                tag: e.tag,
+                protocol: e.protocol as ExitServer["protocol"],
+                host: e.host,
+                port: e.port,
+                link: "",
+                outbound: e.outbound,
+              }))
+              return fail(await buildFlow(exits, [], secrets.mode ?? "links", secrets.subUrl, secrets.links))
             }
 
             if (action === "test") {
               const secrets = await loadSecrets(dir)
               if (!secrets.exits.length || !secrets.ports.length) {
-                return fail("pool not built — run setup-subscription or collect-links first.")
+                return fail("pool not built — run setup-subscription first.")
               }
               const lines: string[] = []
               const count = Math.min(secrets.exits.length, secrets.ports.length)
@@ -1253,7 +1209,7 @@ export default Plugin.define({
             if (action === "refresh") {
               const secrets = await loadSecrets(dir)
               if (secrets.mode !== "subscription" || !secrets.subUrl) {
-                return fail("nothing to refresh (pool was built from clipboard links — collect-links again instead).")
+                return fail("nothing to refresh (no subscription stored — run setup-subscription).")
               }
               await progress("re-fetching the subscription...")
               const sub = await fetchSubscription(secrets.subUrl, secrets.hwid)
@@ -1287,7 +1243,7 @@ export default Plugin.define({
               )
             }
 
-            return fail(`unknown action "${action}". Use: status | setup-subscription | collect-links | build-pool | test | switch-exit | refresh | off.`)
+            return fail(`unknown action "${action}". Use: status | setup-subscription | build-pool | test | switch-exit | refresh | off.`)
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error)
             if (context.signal.aborted || message === "cancelled") {
@@ -1320,7 +1276,7 @@ export default Plugin.define({
                   `Run the \`duck_vpn\` tool once with action "${action}" and report the result briefly.\n\n` +
                   `Rules:\n` +
                   `- Do not print secrets (subscription URL, full links, passwords). Exit tags and ports are fine.\n` +
-                  `- If the result asks for a subscription URL or clipboard links, relay that request to the user and stop.`,
+                  `- If the result asks for a subscription URL, relay that request to the user and stop.`,
               })
               return
             }
@@ -1328,16 +1284,13 @@ export default Plugin.define({
               sessionID,
               delivery,
               text:
-                `Set up the VPN pool with the \`duck_vpn\` tool. Two modes:\n\n` +
-                `1. Subscription (easiest): call \`duck_vpn\` action "setup-subscription" without a url. ` +
-                `It returns an ask-the-user text — relay that to the user, wait for the URL, then call again with it.\n` +
-                `2. Clipboard (device slots full): call \`duck_vpn\` action "collect-links" and tell the user to press ` +
-                `Share on a few servers in happ while it watches the clipboard — links are picked up automatically, ` +
-                `then the pool builds itself.\n\n` +
+                `Set up the VPN pool with the \`duck_vpn\` tool:\n\n` +
+                `1. Start with action "status" to avoid redoing a working pool.\n` +
+                `2. Call action "setup-subscription" without a url. It returns an ask-the-user text — ` +
+                `relay that to the user, wait for the URL, then call again with it.\n\n` +
                 `Rules:\n` +
-                `- Start with action "status" to avoid redoing a working pool.\n` +
-                `- Never print secrets. Never write links or the URL into the repo.\n` +
-                `- If the panel answers 404 (slots full), switch to the clipboard mode and say so.`,
+                `- Never print secrets. Never write the URL into the repo.\n` +
+                `- If the panel answers 404 (device slots full), say so and stop.`,
             })
           },
         })
