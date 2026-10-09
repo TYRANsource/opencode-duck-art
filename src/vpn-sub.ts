@@ -2,8 +2,10 @@
  * happ-compatible subscription fetch + decode.
  *
  * A panel serves either a base64 list of share links (what happ-desktop eats)
- * or a JSON document of ready-made xray configs. v1 supports the base64 list;
- * JSON bodies get a clear "use clipboard mode" error instead of silent garbage.
+ * or a JSON document of ready-made xray configs (one full config per server,
+ * with `remarks` + a `proxy` outbound). Both shapes are supported; entries
+ * whose exit protocol xray cannot dial (hysteria, tuic, wireguard, …) are
+ * skipped with a reason instead of breaking the pool.
  * Requests mimic a happ client (`User-Agent: Happ/1.0` + stable `x-hwid`) so a
  * re-fetch does not burn another device slot on HWID-limited panels.
  */
@@ -11,8 +13,27 @@ import { extractShareLinks } from "./vpn-links.js"
 
 const FETCH_TIMEOUT_MS = 30_000
 
+/** Protocols our sidecar (plain Xray-core) can actually dial. */
+const DIALABLE = new Set(["vless", "vmess", "trojan", "shadowsocks"])
+
+/** One usable exit pulled out of a JSON subscription entry. */
+export interface JsonEntryExit {
+  tag: string
+  protocol: string
+  host: string
+  port: number
+  /** The entry's own `proxy` outbound object (retagged at build time). */
+  outbound: Record<string, unknown>
+}
+
 export interface SubscriptionResult {
+  /** Share links (base64-list shape only). */
   links: string[]
+  /** Usable exits (JSON shape only). */
+  entries: JsonEntryExit[]
+  /** Human reasons for skipped JSON entries (unsupported protocol, no exit…). */
+  skipped: string[]
+  isJson: boolean
   /** Raw `subscription-userinfo` header when the panel sends one. */
   userinfo: string | null
   title: string | null
@@ -30,8 +51,7 @@ export function decodeSubscriptionBody(body: string): string[] {
   if (!text) throw new Error("subscription body is empty")
   if (/^[\[{]/.test(text)) {
     throw new Error(
-      "this subscription serves JSON configs, which duck_vpn does not read yet. " +
-        "Use the clipboard mode instead: share a few servers from happ and run `collect-links`.",
+      "this subscription serves JSON configs: use decodeSubscriptionEntries(), not the link list.",
     )
   }
   // Most panels serve base64; some serve the plain list. Try both.
@@ -78,9 +98,91 @@ export async function fetchSubscription(url: string, hwid: string): Promise<Subs
   }
   if (!res.ok) throw new Error(`the panel answered HTTP ${res.status}`)
   const body = await res.text()
-  return {
-    links: decodeSubscriptionBody(body),
-    userinfo: res.headers.get("subscription-userinfo"),
-    title: res.headers.get("profile-title"),
+  const userinfo = res.headers.get("subscription-userinfo")
+  const title = res.headers.get("profile-title")
+  if (/^\s*\[/.test(body)) {
+    const { entries, skipped } = decodeSubscriptionEntries(body)
+    return { links: [], entries, skipped, isJson: true, userinfo, title }
   }
+  return { links: decodeSubscriptionBody(body), entries: [], skipped: [], isJson: false, userinfo, title }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null
+}
+
+function exitHostPort(outbound: Record<string, unknown>): { host: string; port: number } | null {
+  const settings = asRecord(outbound.settings)
+  if (!settings) return null
+  const first = (key: string): Record<string, unknown> | null => {
+    const list = settings[key]
+    if (!Array.isArray(list) || !list.length) return null
+    return asRecord(list[0])
+  }
+  // vless/vmess: settings.vnext[0]; trojan/shadowsocks: settings.servers[0].
+  const node = first("vnext") ?? first("servers")
+  if (!node) return null
+  const host = node.address
+  const port = Number(node.port)
+  if (typeof host !== "string" || !host || !Number.isInteger(port) || port < 1 || port > 65535) {
+    return null
+  }
+  return { host, port }
+}
+
+/**
+ * Pull usable exits out of a JSON subscription body (array of full xray
+ * configs, one per server). The exit is the outbound tagged `proxy`
+ * (fallback: first dialable non-freedom/blackhole/dns outbound); the panel's
+ * own routing (direct/block bypasses) is intentionally NOT copied — the
+ * sidecar routes each inbound straight to its exit.
+ */
+export function decodeSubscriptionEntries(body: string): { entries: JsonEntryExit[]; skipped: string[] } {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(body)
+  } catch {
+    throw new Error("subscription body is not valid JSON")
+  }
+  if (!Array.isArray(parsed)) throw new Error("JSON subscription is not a list of server configs")
+  const entries: JsonEntryExit[] = []
+  const skipped: string[] = []
+  parsed.forEach((rawEntry, i) => {
+    const label = `#${i + 1}`
+    const entry = asRecord(rawEntry)
+    const outbounds = entry ? entry.outbounds : null
+    if (!entry || !Array.isArray(outbounds)) {
+      skipped.push(`${label}: not a server config object`)
+      return
+    }
+    const candidates = (outbounds as unknown[]).map((o) => asRecord(o)).filter((o) => o !== null)
+    const proxy =
+      candidates.find((o) => o.tag === "proxy") ??
+      candidates.find(
+        (o) => typeof o.protocol === "string" && !["freedom", "blackhole", "dns"].includes(o.protocol),
+      )
+    if (!proxy) {
+      skipped.push(`${label}: no exit outbound found`)
+      return
+    }
+    const protocol = String(proxy.protocol ?? "")
+    if (!DIALABLE.has(protocol)) {
+      skipped.push(`${label}: unsupported protocol "${protocol || "?"}" (xray cannot dial it)`)
+      return
+    }
+    const addr = exitHostPort(proxy)
+    if (!addr) {
+      skipped.push(`${label}: exit has no usable address/port`)
+      return
+    }
+    const remarks = entry.remarks
+    const meta = asRecord(entry.meta)
+    const group = meta && typeof meta.serverDescription === "string" ? meta.serverDescription : ""
+    const tag =
+      (typeof remarks === "string" && remarks.trim()) || (group ? `${group} ${label}` : `server ${label}`)
+    entries.push({ tag: tag.trim(), protocol, host: addr.host, port: addr.port, outbound: proxy })
+  })
+  return { entries, skipped }
 }

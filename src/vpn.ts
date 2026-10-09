@@ -119,9 +119,11 @@ export async function collectFromClipboard(
   }
 }
 
-/** Validate links, start the sidecar, probe every exit. Throws on total failure. */
-export async function buildPoolFromLinks(rawLinks: string[], opts: BuildOptions): Promise<BuiltPool> {
-  const dir = opts.dir ?? vpnDir()
+/** Validate raw share links into exits (at most `poolSize`), collecting skip reasons. */
+export function parseLinkPool(
+  rawLinks: string[],
+  poolSize: number,
+): { exits: ExitServer[]; skipped: string[] } {
   const exits: ExitServer[] = []
   const skipped: string[] = []
   const seen = new Set<string>()
@@ -134,30 +136,43 @@ export async function buildPoolFromLinks(rawLinks: string[], opts: BuildOptions)
     } catch (error) {
       skipped.push(`${link.slice(0, 60)}…: ${error instanceof Error ? error.message : String(error)}`)
     }
-    if (exits.length >= opts.poolSize) break
+    if (exits.length >= poolSize) break
   }
+  return { exits, skipped }
+}
+
+/** Validate links, start the sidecar, probe every exit. Throws on total failure. */
+export async function buildPoolFromLinks(rawLinks: string[], opts: BuildOptions): Promise<BuiltPool> {
+  const { exits, skipped } = parseLinkPool(rawLinks, opts.poolSize)
   if (!exits.length) {
-    throw new Error(
-      "no link usable." + (skipped.length ? `\n- ${skipped.join("\n- ")}` : ""),
-    )
+    throw new Error("no link usable." + (skipped.length ? `\n- ${skipped.join("\n- ")}` : ""))
   }
+  const built = await buildPoolFromExits(exits, opts)
+  return { ...built, skipped: [...skipped, ...built.skipped] }
+}
+
+/** Start the sidecar for ready exits and probe each one. Throws on total failure. */
+export async function buildPoolFromExits(exits: ExitServer[], opts: BuildOptions): Promise<BuiltPool> {
+  const dir = opts.dir ?? vpnDir()
+  const bounded = exits.slice(0, opts.poolSize)
+  if (!bounded.length) throw new Error("no exits to build the pool from.")
   const say = opts.progress ?? (async () => undefined)
   const xrayExe = await findXray(opts.xrayPath)
   await say(`xray: ${xrayExe}`)
-  const ports = await pickPorts(opts.basePort, exits.length)
-  const { proxies } = await startSidecar(xrayExe, exits, ports, dir, say)
+  const ports = await pickPorts(opts.basePort, bounded.length)
+  const { proxies } = await startSidecar(xrayExe, bounded, ports, dir, say)
   const probeMs: number[] = []
   const alive: number[] = []
-  for (let i = 0; i < exits.length; i++) {
+  for (let i = 0; i < bounded.length; i++) {
     try {
       const ms = await probeExit(ports[i])
       probeMs.push(ms)
       alive.push(i)
-      await say(`exit ${i + 1} OK (${ms}ms): ${exits[i].tag}`)
+      await say(`exit ${i + 1} OK (${ms}ms): ${bounded[i].tag}`)
     } catch (error) {
       probeMs.push(-1)
       await say(
-        `exit ${i + 1} UNREACHABLE: ${exits[i].tag} (${error instanceof Error ? error.message : String(error)})`,
+        `exit ${i + 1} UNREACHABLE: ${bounded[i].tag} (${error instanceof Error ? error.message : String(error)})`,
       )
     }
   }
@@ -165,19 +180,36 @@ export async function buildPoolFromLinks(rawLinks: string[], opts: BuildOptions)
     await stopSidecar(dir)
     throw new Error("no exit reached duck.ai — check the servers in happ and retry.")
   }
-  return { exits, proxies, ports, probeMs, skipped }
+  return { exits: bounded, proxies, ports, probeMs, skipped: [] }
 }
 
-/** Persist pool links/ports into the secret store (mode + links). */
+/** Persist pool links/exits/ports into the secret store (mode + links). */
 export async function rememberPool(
   mode: VpnSecrets["mode"],
   links: string[],
+  exits: ExitServer[],
   ports: number[],
   subUrl: string | undefined,
   dir: string = vpnDir(),
 ): Promise<void> {
   const secrets = await loadSecrets(dir)
-  await saveSecrets({ ...secrets, mode, links, ports, subUrl }, dir)
+  await saveSecrets(
+    {
+      ...secrets,
+      mode,
+      links,
+      exits: exits.map((e) => ({
+        tag: e.tag,
+        protocol: e.protocol,
+        host: e.host,
+        port: e.port,
+        outbound: e.outbound,
+      })),
+      ports,
+      subUrl,
+    },
+    dir,
+  )
 }
 
 /** Add or replace the `DUCKAI_PROXIES=` line in the relay `.env` (backup once). */

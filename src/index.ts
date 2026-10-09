@@ -5,12 +5,13 @@ import { access, mkdir, readFile, writeFile } from "node:fs/promises"
 import { basename, extname, isAbsolute, join, resolve } from "node:path"
 import { homedir, tmpdir } from "node:os"
 import { pathToFileURL } from "node:url"
-import { parseShareLink } from "./vpn-links.js"
+import { type ExitServer } from "./vpn-links.js"
 import {
-  buildPoolFromLinks,
+  buildPoolFromExits,
   collectFromClipboard,
   detectHapp,
   mergeRelayEnv,
+  parseLinkPool,
   pidOnPort,
   readPoolProxies,
   readRelayEnvProxies,
@@ -1059,13 +1060,16 @@ export default Plugin.define({
 
             /** Build sidecar + wire relay, shared by every setup path. */
             const buildFlow = async (
-              links: string[],
+              exits: ExitServer[],
+              skipped: string[],
               mode: "subscription" | "links",
               subUrl: string | undefined,
+              linksToStore: string[],
             ): Promise<string> => {
               if (context.signal.aborted) throw new Error("cancelled")
-              const built = await buildPoolFromLinks(links, buildOpts)
-              await rememberPool(mode, links.slice(0, built.exits.length), built.ports, subUrl, dir)
+              const built = await buildPoolFromExits(exits, buildOpts)
+              const allSkipped = [...skipped, ...built.skipped]
+              await rememberPool(mode, linksToStore.slice(0, linksToStore.length), built.exits, built.ports, subUrl, dir)
               await mergeRelayEnv(relayDir, built.proxies)
               await vpnLog(`pool built (${mode}): ${built.exits.length} exits`, dir)
               if (context.signal.aborted) throw new Error("cancelled")
@@ -1076,12 +1080,25 @@ export default Plugin.define({
                   (d, i) => `  ${d} — probe ${built.probeMs[i] === -1 ? "FAILED" : `${built.probeMs[i]}ms`}`,
                 ),
               ]
-              if (built.skipped.length) {
-                lines.push(`Skipped ${built.skipped.length} link(s):`)
-                for (const s of built.skipped.slice(0, 5)) lines.push(`  - ${s}`)
+              if (allSkipped.length) {
+                lines.push(`Skipped ${allSkipped.length} server(s):`)
+                for (const s of allSkipped.slice(0, 5)) lines.push(`  - ${s}`)
               }
               lines.push("Ban/limit on one exit now auto-rotates to the next inside the same `gen` call.")
               return lines.join("\n")
+            }
+
+            /** Summarize a fetched subscription (either shape) for progress. */
+            const describeSub = (
+              sub: { links: string[]; entries: { tag: string }[]; skipped: string[]; isJson: boolean; title: string | null; userinfo: string | null },
+            ): string => {
+              const count = sub.isJson ? sub.entries.length : sub.links.length
+              return (
+                `subscription OK: ${count} server(s)` +
+                (sub.title ? ` (${sub.title})` : "") +
+                (sub.userinfo ? ` [${sub.userinfo}]` : "") +
+                (sub.skipped.length ? `, skipped ${sub.skipped.length}` : "")
+              )
             }
 
             if (action === "status") {
@@ -1101,16 +1118,23 @@ export default Plugin.define({
                 `relay ${RELAY_URL}: ${relayUp ? "up" : "down"}, .env pool: ${envProxies.length} exit(s)`,
                 `happ app local inbound: ${happ.inbound ? `yes (${happ.ports.join(", ")})` : "no"}`,
               ]
-              if (secrets.links.length && secrets.ports.length === secrets.links.slice(0, vpnOpts.poolSize).length) {
-                try {
-                  const exits = secrets.links.slice(0, secrets.ports.length).map((l) => parseShareLink(l))
-                  lines.push("exits:")
-                  for (const d of describeExits(exits, secrets.ports)) lines.push(`  ${d}`)
-                } catch {
-                  lines.push("stored links are unreadable — rebuild the pool.");
+              if (secrets.exits.length && secrets.ports.length) {
+                lines.push("exits:")
+                for (const d of describeExits(
+                  secrets.exits.slice(0, secrets.ports.length).map((e) => ({
+                    tag: e.tag,
+                    protocol: e.protocol as ExitServer["protocol"],
+                    host: e.host,
+                    port: e.port,
+                    link: "",
+                    outbound: e.outbound,
+                  })),
+                  secrets.ports,
+                )) {
+                  lines.push(`  ${d}`)
                 }
-              } else if (secrets.links.length) {
-                lines.push(`stored links: ${secrets.links.length} (pool not built — run build-pool).`);
+              } else if (secrets.exits.length || secrets.links.length) {
+                lines.push("servers stored but pool not built — run build-pool.");
               } else {
                 lines.push("no servers stored — run setup-subscription or collect-links.");
               }
@@ -1128,44 +1152,73 @@ export default Plugin.define({
               const secrets = await loadSecrets(dir)
               await progress("fetching the subscription...")
               const sub = await fetchSubscription(url, secrets.hwid)
-              await progress(
-                `subscription OK: ${sub.links.length} server(s)` +
-                  (sub.title ? ` (${sub.title})` : "") +
-                  (sub.userinfo ? ` [${sub.userinfo}]` : ""),
-              )
-              return fail(await buildFlow(sub.links, "subscription", url))
+              await progress(describeSub(sub))
+              if (sub.isJson) {
+                if (!sub.entries.length) {
+                  return fail(
+                    "no usable exits in this subscription." +
+                      (sub.skipped.length ? `\n- ${sub.skipped.slice(0, 8).join("\n- ")}` : ""),
+                  )
+                }
+                const exits: ExitServer[] = sub.entries.slice(0, vpnOpts.poolSize).map((e) => ({
+                  tag: e.tag,
+                  protocol: e.protocol as ExitServer["protocol"],
+                  host: e.host,
+                  port: e.port,
+                  link: "",
+                  outbound: e.outbound,
+                }))
+                return fail(await buildFlow(exits, sub.skipped, "subscription", url, []))
+              }
+              const { exits, skipped } = parseLinkPool(sub.links, vpnOpts.poolSize)
+              if (!exits.length) {
+                return fail("no usable exits in this subscription." + (skipped.length ? `\n- ${skipped.slice(0, 8).join("\n- ")}` : ""))
+              }
+              return fail(await buildFlow(exits, skipped, "subscription", url, sub.links))
             }
 
             if (action === "collect-links") {
               const need = Math.min(Math.max(Math.trunc(Number(input.need)) || vpnOpts.poolSize, 1), 8)
               const timeout = Math.max(Math.trunc(Number(input.timeoutSec)) || vpnOpts.collectTimeoutSec, 15)
               const links = await collectFromClipboard(need, timeout, progress)
-              return fail(await buildFlow(links, "links", undefined))
+              const { exits, skipped } = parseLinkPool(links, vpnOpts.poolSize)
+              if (!exits.length) {
+                return fail("no usable exits collected." + (skipped.length ? `\n- ${skipped.slice(0, 8).join("\n- ")}` : ""))
+              }
+              return fail(await buildFlow(exits, skipped, "links", undefined, links))
             }
 
             if (action === "build-pool") {
               const secrets = await loadSecrets(dir)
               const links = input.links?.length ? input.links : secrets.links
-              if (!links.length) {
-                return fail("no links: pass `links` or run setup-subscription / collect-links first.")
+              if (links.length) {
+                const { exits, skipped } = parseLinkPool(links, vpnOpts.poolSize)
+                if (!exits.length) return fail("no usable exits in the given links.")
+                return fail(await buildFlow(exits, skipped, secrets.mode ?? "links", secrets.subUrl, links))
               }
-              return fail(await buildFlow(links, secrets.mode ?? "links", secrets.subUrl))
+              if (secrets.exits.length) {
+                const exits: ExitServer[] = secrets.exits.slice(0, vpnOpts.poolSize).map((e) => ({
+                  tag: e.tag,
+                  protocol: e.protocol as ExitServer["protocol"],
+                  host: e.host,
+                  port: e.port,
+                  link: "",
+                  outbound: e.outbound,
+                }))
+                return fail(await buildFlow(exits, [], secrets.mode ?? "links", secrets.subUrl, secrets.links))
+              }
+              return fail("no links: pass `links` or run setup-subscription / collect-links first.")
             }
 
             if (action === "test") {
               const secrets = await loadSecrets(dir)
-              if (!secrets.links.length || !secrets.ports.length) {
+              if (!secrets.exits.length || !secrets.ports.length) {
                 return fail("pool not built — run setup-subscription or collect-links first.")
               }
               const lines: string[] = []
-              const count = Math.min(secrets.links.length, secrets.ports.length)
+              const count = Math.min(secrets.exits.length, secrets.ports.length)
               for (let i = 0; i < count; i++) {
-                let tag = secrets.links[i].slice(0, 40)
-                try {
-                  tag = parseShareLink(secrets.links[i]).tag
-                } catch {
-                  // Keep the truncated link as the label.
-                }
+                const tag = secrets.exits[i].tag
                 const up = await portBusy(secrets.ports[i])
                 if (!up) {
                   lines.push(`${i + 1}. ${tag}: inbound down`)
@@ -1184,14 +1237,14 @@ export default Plugin.define({
             if (action === "switch-exit") {
               const secrets = await loadSecrets(dir)
               const idx = Math.trunc(Number(input.index)) || 0
-              if (!secrets.links.length || idx < 1 || idx > Math.min(secrets.links.length, secrets.ports.length)) {
+              if (!secrets.exits.length || idx < 1 || idx > Math.min(secrets.exits.length, secrets.ports.length)) {
                 return fail("pass a valid 1-based `index` (see status for the exit list).")
               }
-              const order = secrets.links.map((_, i) => i)
+              const order = secrets.exits.map((_, i) => i)
               order.sort((a, b) => (a === idx - 1 ? -1 : b === idx - 1 ? 1 : a - b))
-              const links = order.map((i) => secrets.links[i])
+              const exits = order.map((i) => secrets.exits[i])
               const ports = order.map((i) => secrets.ports[i])
-              await saveSecrets({ ...secrets, links, ports }, dir)
+              await saveSecrets({ ...secrets, exits, ports }, dir)
               await mergeRelayEnv(relayDir, ports.map((p) => `socks5://127.0.0.1:${p}`))
               const restarted = await restartRelay(relayDir)
               return fail(`exit ${idx} is now preferred. Relay ${restarted ? "restarted" : "restart FAILED"}.`)
@@ -1204,7 +1257,22 @@ export default Plugin.define({
               }
               await progress("re-fetching the subscription...")
               const sub = await fetchSubscription(secrets.subUrl, secrets.hwid)
-              return fail(await buildFlow(sub.links, "subscription", secrets.subUrl))
+              await progress(describeSub(sub))
+              if (sub.isJson) {
+                if (!sub.entries.length) return fail("no usable exits in this subscription anymore.")
+                const exits: ExitServer[] = sub.entries.slice(0, vpnOpts.poolSize).map((e) => ({
+                  tag: e.tag,
+                  protocol: e.protocol as ExitServer["protocol"],
+                  host: e.host,
+                  port: e.port,
+                  link: "",
+                  outbound: e.outbound,
+                }))
+                return fail(await buildFlow(exits, sub.skipped, "subscription", secrets.subUrl, []))
+              }
+              const { exits, skipped } = parseLinkPool(sub.links, vpnOpts.poolSize)
+              if (!exits.length) return fail("no usable exits in this subscription anymore.")
+              return fail(await buildFlow(exits, skipped, "subscription", secrets.subUrl, sub.links))
             }
 
             if (action === "off") {
@@ -1215,7 +1283,7 @@ export default Plugin.define({
               const restarted = await restartRelay(relayDir)
               await vpnLog("pool disabled (off)", dir)
               return fail(
-                `VPN pool off${stopped ? " (sidecar stopped)" : ""}. Relay ${restarted ? "restarted direct" : "restart FAILED"}. Stored links are kept — build-pool re-enables.`,
+                `VPN pool off${stopped ? " (sidecar stopped)" : ""}. Relay ${restarted ? "restarted direct" : "restart FAILED"}. Stored servers are kept — build-pool re-enables.`,
               )
             }
 

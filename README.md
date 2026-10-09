@@ -97,7 +97,9 @@ Secrets (subscription URL, share links) live in the per-user data dir
 (`%LOCALAPPDATA%/opencode/duck-vpn` on Windows,
 `~/.local/share/opencode/duck-vpn` elsewhere) — never in the repo, never in
 `duck-art.json`. Supported links: `vless://` (tcp/ws/grpc, tls/reality),
-`vmess://`, `trojan://`, `ss://`.
+`vmess://`, `trojan://`, `ss://`. JSON-config subscriptions (one ready-made
+xray config per server, the way happ panels serve them) are read directly —
+entries xray cannot dial (hysteria, …) are skipped with a reason.
 
 Other actions: `duck_vpn` → `status` (pool/sidecar/relay at a glance), `test`
 (probe every exit against duck.ai), `switch-exit` (prefer one), `refresh`
