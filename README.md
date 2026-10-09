@@ -58,6 +58,51 @@ Built-ins: `square`, `landscape`, `portrait`, `icon`. A preset's `style` text is
 to the prompt, so the caller writes *what* to draw and the preset decides *how and where*.
 (Duck.ai may return a slightly different size than requested.)
 
+## VPN pool (`duck_vpn` / `/duck-vpn`)
+
+Duck.ai bans by IP (`ERR_BN_LIMIT`, persistent). The plugin can route **only the
+relay's browser** through VPN exits while the rest of the machine stays direct —
+no system VPN changes, the happ app is never touched.
+
+How: an own Xray-core sidecar (one local SOCKS inbound per exit, each pinned to
+its own server) + `DUCKAI_PROXIES` pool in the relay. A ban on one exit
+auto-rotates to the next **inside the same `gen` call** — nobody clicks anything.
+
+Two setup modes (`/duck-vpn` guides through both):
+
+1. **Subscription (easiest).** Paste your happ subscription URL once. The plugin
+   fetches it as a happ client with a stable per-machine HWID, so re-fetches
+   don't burn new device slots.
+2. **Clipboard (device slots full).** The plugin watches the clipboard while you
+   press Share on a few servers in happ — links are picked up automatically, no
+   new device is registered on the panel, the pool builds itself.
+
+```jsonc
+// .opencode/duck-art.json
+{
+  "vpn": {
+    "poolSize": 4, // exits in the pool (1..8)
+    "basePort": 11808, // first local SOCKS port (happ's own 10808/10809 are skipped)
+    "xrayPath": "C:/tools/xray.exe", // default: happ-desktop's bundled core, else PATH
+    "collectTimeoutSec": 180
+  }
+}
+```
+
+The xray binary is reused from the happ-desktop install when present; otherwise
+put [Xray-core](https://github.com/XTLS/Xray-core/releases) on `PATH` or point
+`vpn.xrayPath` at it. Nothing else is downloaded.
+
+Secrets (subscription URL, share links) live in the per-user data dir
+(`%LOCALAPPDATA%/opencode/duck-vpn` on Windows,
+`~/.local/share/opencode/duck-vpn` elsewhere) — never in the repo, never in
+`duck-art.json`. Supported links: `vless://` (tcp/ws/grpc, tls/reality),
+`vmess://`, `trojan://`, `ss://`.
+
+Other actions: `duck_vpn` → `status` (pool/sidecar/relay at a glance), `test`
+(probe every exit against duck.ai), `switch-exit` (prefer one), `refresh`
+(re-fetch the subscription), `off` (back to direct).
+
 ## Caveats
 
 - Duck.ai rate-limits (`ERR_BN_LIMIT`) and can serve a CAPTCHA (`ERR_CHALLENGE`);
